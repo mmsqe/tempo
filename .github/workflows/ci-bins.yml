@@ -1,0 +1,122 @@
+# Publishes the two binaries mmsqe/tempo-e2e needs to drive a node, once per commit on
+# main. Without this the e2e repo builds them itself on every run, which cost ~15 minutes
+# of wall clock on each of its pull requests -- the anchoring precompile is not upstream,
+# so it cannot use a tempoxyz release.
+#
+# Fork-only. Upstream has Depot runners and the docker.yml image pipeline and needs none
+# of this; the guard below keeps the job from running if the file ever reaches
+# tempoxyz/tempo. Note that docker.yml also declines to build on push to main outside
+# tempoxyz/tempo, so this workflow does not duplicate anything here.
+
+name: CI binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# Per-commit so a re-run supersedes itself while distinct commits still build in parallel;
+# the e2e suite asks for an exact SHA, so a later push must not cancel an earlier build.
+concurrency:
+  group: ci-bins-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  # Rolling prerelease holding one tarball per recent commit. A plain tag keeps the assets
+  # publicly downloadable, so tempo-e2e needs no cross-repo token.
+  RELEASE_TAG: ci-bins
+  KEEP_ASSETS: "15"
+
+jobs:
+  build:
+    name: Build and publish node binaries
+    if: ${{ github.repository != 'tempoxyz/tempo' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Default features only, matching what the e2e harness asks for: asm-keccak,
+      # jemalloc and otlp are throughput and observability knobs it does not exercise.
+      #
+      # profile.release is opt-level=3 + lto="thin". Thin LTO over the whole reth-derived
+      # dependency closure plus the link is roughly 10 minutes of an 11m38s build on these
+      # 4-core runners, even with every dependency restored from cache. These binaries only
+      # ever drive a functional test suite, so the tuning buys nothing and the wait is real.
+      # tempo-e2e's fallback source build sets the same overrides, so the two agree.
+      - name: Build the node binaries
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+        run: cargo build --release --bin tempo --bin tempo-xtask
+
+      # tempo-xtask ships alongside the node because the hardfork tests generate their own
+      # genesis to schedule a fork past block 0, which a prebuilt genesis cannot express.
+      - name: Package
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tar -czf "tempo-bins-${COMMIT_SHA}-x86_64-linux.tar.gz" \
+            -C target/release tempo tempo-xtask
+
+      - name: Publish to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --prerelease \
+              --title "CI binaries" \
+              --notes "Rolling \`tempo\` + \`tempo-xtask\` builds consumed by mmsqe/tempo-e2e. One tarball per recent commit on main; assets are pruned. Built without LTO -- functional testing only, not for benchmarking or deployment."
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "tempo-bins-${COMMIT_SHA}-x86_64-linux.tar.gz" --clobber
+
+      # Unbounded assets would grow the release without limit. Keep the newest few; an
+      # e2e run wanting an evicted commit falls back to building from source.
+      - name: Prune stale assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json assets \
+            --jq ".assets | sort_by(.createdAt) | reverse | .[${KEEP_ASSETS}:] | .[].name" \
+          | while IFS= read -r stale; do
+              [ -n "$stale" ] || continue
+              echo "pruning $stale"
+              gh release delete-asset "$RELEASE_TAG" "$stale" --yes
+            done
+
+      - name: Summarize
+        if: ${{ always() }}
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "## CI binaries"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Commit | \`${COMMIT_SHA}\` |"
+            echo "| Asset | \`tempo-bins-${COMMIT_SHA}-x86_64-linux.tar.gz\` |"
+            echo "| Release | [${RELEASE_TAG}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${RELEASE_TAG}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
