@@ -2,9 +2,10 @@ name: Test
 
 permissions: {}
 
+# Fork: no push-to-main trigger. That push exists to run ci-bins.yml, and this repo's
+# runner pool is small enough that upstream's push CI queues for hours behind it. PRs and
+# merge_group still get the full suite.
 on:
-  push:
-    branches: [main]
   pull_request:
   merge_group:
 

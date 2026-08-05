@@ -1,12 +1,9 @@
 name: Scan GitHub Actions
 
+# Fork: no push-to-main trigger; see test.yml. The pull_request trigger below still gates
+# every .github/** change, which is where the scan actually blocks a mistake.
 on:
   pull_request:
-    paths:
-      - ".github/**"
-  push:
-    branches:
-      - main
     paths:
       - ".github/**"
   schedule:

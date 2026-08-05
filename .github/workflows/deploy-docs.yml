@@ -2,12 +2,9 @@ name: Deploy TIPs to Docs
 
 permissions: {}
 
+# Fork: no push-to-main trigger; see test.yml. This fork does not publish TIP docs, so the
+# workflow is now workflow_dispatch only.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "tips/**"
-      - ".github/workflows/deploy-docs.yml"
   workflow_dispatch:
 
 jobs:

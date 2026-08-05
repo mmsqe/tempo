@@ -2,9 +2,9 @@ name: Lint
 
 permissions: {}
 
+# Fork: no push-to-main trigger; see test.yml. Drops `crate-checks` and `deploy-docs`,
+# which were already push-only and so never ran on this fork's pull requests anyway.
 on:
-  push:
-    branches: [main]
   pull_request:
   merge_group:
 

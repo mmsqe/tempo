@@ -4,18 +4,9 @@ permissions:
   contents: read
   id-token: write
 
+# Fork: no push-to-main trigger; see test.yml. CodSpeed loses its main-branch baseline
+# here, which this fork does not act on -- use workflow_dispatch to backfill if needed.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**/Cargo.toml"
-      - "crates/primitives/**"
-      - "crates/alloy/**"
-      - "crates/precompiles/**"
-      - "crates/revm/**"
-      - "crates/evm/**"
   pull_request:
     paths:
       - "Cargo.lock"
