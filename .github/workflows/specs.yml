@@ -2,19 +2,8 @@ name: Specs
 
 permissions: {}
 
+# Fork: no push-to-main trigger; see test.yml.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**/Cargo.toml"
-      - "tips/verify/**"
-      - "crates/contracts/**"
-      - "crates/precompiles/**"
-      - "scripts/foundry-patch.sh"
-      - ".github/workflows/specs.yml"
-      - ".github/workflows/update-reth.yml"
   merge_group:
   pull_request:
 

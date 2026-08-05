@@ -2,13 +2,8 @@ name: RPC Tests
 
 permissions: {}
 
+# Fork: no push-to-main trigger; see test.yml.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/node/**'
-      - 'crates/primitives/**'
-      - 'crates/revm/**'
   pull_request:
     paths:
       - 'crates/node/**'

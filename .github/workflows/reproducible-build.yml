@@ -12,10 +12,9 @@ concurrency:
   group: reproducible-build-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
+# Fork: no push-to-main trigger; see test.yml. This one has no PR trigger upstream, so it
+# is now workflow_dispatch only -- run it by hand when a release build needs verifying.
 on:
-  push:
-    branches: [main]
-
   workflow_dispatch:
     inputs:
       ref:
