@@ -163,7 +163,10 @@ jobs:
   deny:
     permissions:
       contents: read
-    uses: tempoxyz/ci/.github/workflows/deny.yml@400fd3f4ee8c60dae645f7ea2c261aed6d66e5b5 # main
+      id-token: write
+    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@3a9189ec4c3d19f2863398822c73edd06b33fba3
+    with:
+      rust-toolchain: nightly
 
   zepter:
     name: zepter
