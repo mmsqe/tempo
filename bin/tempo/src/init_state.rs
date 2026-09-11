@@ -34,7 +34,7 @@ use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{
     BlockNumReader, DBProvider, DatabaseProviderFactory, HashingWriter, RocksDBProviderFactory,
     StaticFileProviderFactory, StaticFileSegment, StorageChangeSetReader, StorageSettingsCache,
-    TrieWriter,
+    TrieWriter, providers::RocksDBProvider,
 };
 use reth_trie::{IntermediateStateRootState, StateRootProgress};
 use reth_trie_db::DatabaseStateRoot;
@@ -320,9 +320,9 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
             write_storage_changesets(storage_changeset_factory, storage_changeset_collector)
         });
 
-        let storage_history_factory = provider_factory;
+        let storage_history_rocksdb = provider_factory.rocksdb_provider();
         let storage_history_worker = thread::spawn(move || {
-            write_storage_history(storage_history_factory, storage_history_collector)
+            write_storage_history(&storage_history_rocksdb, storage_history_collector)
         });
 
         // Load sorted entries from each ETL collector into its database table.
@@ -478,16 +478,17 @@ where
     Ok(())
 }
 
-fn write_storage_history<P>(
-    provider: P,
+/// Marks every slot in `collector` as last changed at block 0.
+///
+/// Puts without looking the entry up first: at block 0 there is no other history
+/// to keep, and once compaction merges the loaded keys with the genesis entries
+/// sorting after them, every lookup reads an index block too big to stay cached.
+fn write_storage_history(
+    rocksdb: &RocksDBProvider,
     mut collector: Collector<Vec<u8>, CompactU256>,
-) -> eyre::Result<()>
-where
-    P: RocksDBProviderFactory + Send + 'static,
-{
+) -> eyre::Result<()> {
     info!(target: "tempo::cli", "Writing storage history...");
 
-    let rocksdb = provider.rocksdb_provider();
     let mut batch = rocksdb.batch_with_auto_commit();
     let block_zero_history =
         tables::BlockNumberList::new([0]).expect("single block is always sorted");
@@ -497,13 +498,10 @@ where
         total,
         "storage history",
         |address, key, _| {
-            let history_key = StorageShardedKey::last(address, key);
-            if batch
-                .get::<tables::StoragesHistory>(history_key.clone())?
-                .is_none()
-            {
-                batch.put::<tables::StoragesHistory>(history_key, &block_zero_history)?;
-            }
+            batch.put::<tables::StoragesHistory>(
+                StorageShardedKey::last(address, key),
+                &block_zero_history,
+            )?;
             Ok(())
         },
     )?;
