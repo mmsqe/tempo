@@ -13,7 +13,6 @@
 use std::{iter::repeat_with, net::SocketAddr, time::Duration};
 
 use alloy_primitives::Address;
-use commonware_consensus::types::Epoch;
 use commonware_cryptography::{
     Signer as _,
     bls12381::{
@@ -75,7 +74,7 @@ fn generate_consensus_node_config(
     .unwrap();
 
     let onchain_dkg_outcome = OnchainDkgOutcome {
-        epoch: Epoch::zero(),
+        epoch: 0,
         output: initial_dkg_outcome,
         next_players: shares.keys().clone(),
         is_next_full_dkg: false,
@@ -268,6 +267,11 @@ pub async fn setup_validators(
         fee_recipient,
     );
 
+    let network_identity = tempo_chainspec::NetworkIdentity {
+        from_epoch: onchain_dkg_outcome.epoch,
+        identity: *onchain_dkg_outcome.network_identity(),
+    };
+
     let execution_runtime = ExecutionRuntime::builder()
         .with_epoch_length(epoch_length)
         .with_initial_dkg_outcome(onchain_dkg_outcome)
@@ -306,6 +310,7 @@ pub async fn setup_validators(
             private_key,
             oracle.clone(),
             share,
+            network_identity.clone(),
             feed_state,
             proposal_return_budget,
             execution_runtime.handle(),

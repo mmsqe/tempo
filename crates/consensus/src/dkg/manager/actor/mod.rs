@@ -50,6 +50,7 @@ use tracing::{Level, Span, debug, info, info_span, instrument, warn};
 
 use crate::consensus::{Digest, block::Block};
 
+mod startup;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -127,6 +128,9 @@ pub(crate) struct Actor<
     /// The runtime context passed in when constructing the actor.
     context: ContextCell<TContext>,
 
+    /// Opened during initialization, before authenticating the tip. Taken when the actor starts.
+    storage: Option<state::Unverified<TContext>>,
+
     /// The channel over which the actor will receive messages.
     mailbox: mpsc::UnboundedReceiver<super::Message>,
 
@@ -152,12 +156,32 @@ where
         context: TContext,
         mailbox: mpsc::UnboundedReceiver<super::ingress::Message>,
     ) -> eyre::Result<Self> {
-        let context = ContextCell::new(context);
+        let mut context = ContextCell::new(context);
         let metrics = Metrics::init(context.as_present());
+
+        let storage = state::builder()
+            .partition_prefix(&config.partition_prefix)
+            .init_unverified(context.child("state"))
+            .await?;
+
+        // Authenticate with the original persisted identity before healing can
+        // replace stale state with an outcome supplied by the snapshot.
+        startup::verify_finalized_tip(
+            &mut *context,
+            &config.network_identity,
+            storage.state(),
+            config
+                .finalized_tip
+                .as_ref()
+                .map(|(height, certificate)| (*height, certificate)),
+            config.last_finalized_height,
+            &config.scheme_provider,
+        )?;
 
         Ok(Self {
             config,
             context,
+            storage: Some(storage),
             mailbox,
             metrics,
             pending_finalized_blocks: FuturesOrdered::new(),
@@ -183,14 +207,10 @@ where
     ) {
         // NOTE: The instrumented fns emits on error events
 
-        let Ok(opened) = state::builder()
-            .partition_prefix(&self.config.partition_prefix)
-            .init_unverified(self.context.child("state"))
-            .await
-        else {
-            return;
-        };
-
+        let opened = self
+            .storage
+            .take()
+            .expect("storage opened during initialization");
         let Ok(mut storage) = self.heal(opened).await else {
             return;
         };
@@ -873,7 +893,7 @@ where
         }
 
         Ok(Some(State {
-            epoch: onchain_outcome.epoch,
+            epoch: onchain_outcome.epoch(),
             seed: Summary::random(self.context.as_present_mut()),
             output: onchain_outcome.output.clone(),
             share,
@@ -1208,7 +1228,7 @@ where
         request
             .response
             .send(OnchainDkgOutcome {
-                epoch: next_epoch,
+                epoch: next_epoch.get(),
                 output,
                 next_players,
                 is_next_full_dkg: will_be_re_dkg,
@@ -1302,7 +1322,7 @@ where
         }
 
         let mut state = State {
-            epoch: onchain_outcome.epoch,
+            epoch: onchain_outcome.epoch(),
             seed: Summary::random(&mut self.context),
             output: onchain_outcome.output.clone(),
             share: state::ShareState::Plaintext(share),
@@ -1352,7 +1372,7 @@ where
         .wrap_err("failed reading outcome for ceremony boundary")?;
 
         ensure!(
-            ceremony_outcome.epoch == ceremony_epoch,
+            ceremony_outcome.epoch() == ceremony_epoch,
             "boundary outcome is for epoch `{}`, expected ceremony epoch `{ceremony_epoch}`",
             ceremony_outcome.epoch,
         );
@@ -1365,7 +1385,7 @@ where
         }
 
         let ceremony_state = State {
-            epoch: ceremony_outcome.epoch,
+            epoch: ceremony_outcome.epoch(),
             seed: state.seed,
             output: ceremony_outcome.output,
             share: state::ShareState::Plaintext(None),
