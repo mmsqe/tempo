@@ -14,15 +14,17 @@ use std::{
 };
 
 use alloy_primitives::{
-    B256, U256, keccak256,
-    map::{AddressMap, Entry},
+    B256, U256,
+    map::{AddressMap, B256Map, Entry, HashMap},
+    utils::keccak256_uncached,
 };
 use clap::Parser;
 use eyre::{Context as _, ensure};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use reth_chainspec::EthereumHardforks;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, EnvironmentArgs};
 use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRW},
+    cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW},
     models::{
         BlockNumberAddress, CompactU256, StorageBeforeTx, storage_sharded_key::StorageShardedKey,
     },
@@ -40,7 +42,10 @@ use reth_provider::{
     providers::{ProviderNodeTypes, RocksDBProvider},
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
-use reth_trie::{IntermediateStateRootState, StateRootProgress};
+use reth_trie::{
+    BranchNodeCompact, HashBuilder, IntermediateStateRootState, Nibbles, StateRootProgress,
+    updates::{StorageTrieUpdates, TrieUpdates},
+};
 use reth_trie_db::DatabaseStateRoot;
 use tempo_chainspec::spec::TempoChainSpecParser;
 use tracing::info;
@@ -60,11 +65,18 @@ const ZSTD_MAGIC: [u8; 4] = zstd::zstd_safe::MAGICNUMBER.to_le_bytes();
 /// ETL collector file size (200 MiB per temp file before spilling a new one).
 const ETL_FILE_SIZE: usize = 200 * 1024 * 1024;
 
-/// Maximum number of storage entries to hash per worker batch.
-const WORKER_CHUNK_SIZE: usize = 100;
+/// Storage entries handed to the hash worker at a time; each chunk is hashed in parallel.
+const WORKER_CHUNK_SIZE: usize = 4096;
 
-/// Bounded channel depth for the hashing worker thread.
-const HASH_WORKER_QUEUE_DEPTH: usize = 256;
+/// Chunks in flight between the reader and the hash worker.
+const HASH_WORKER_QUEUE_DEPTH: usize = 64;
+
+/// Subtries an account's storage trie is built from in parallel: one per leading nibble.
+const STORAGE_SUBTRIES: u8 = 16;
+
+/// Accounts with at least this many loaded slots get their storage trie built by nibble;
+/// smaller ones are left to the sequential state root pass.
+const PARALLEL_TRIE_MIN_SLOTS: u64 = 1_000_000;
 
 /// Initialize state from a binary dump file.
 #[derive(Debug, Parser)]
@@ -125,10 +137,10 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
 
         // Track addresses and their account data for hashing
         let mut accounts_seen: AddressMap<Account> = AddressMap::default();
+        let mut slot_counts: AddressMap<u64> = AddressMap::default();
 
         // ETL collectors: accumulate entries sorted, spill to disk when full
-        let mut hash_chunk: Vec<(alloy_primitives::Address, B256, CompactU256)> =
-            Vec::with_capacity(WORKER_CHUNK_SIZE);
+        let mut hash_chunk: Vec<(B256, B256, CompactU256)> = Vec::with_capacity(WORKER_CHUNK_SIZE);
         // Skipping also leaves the segment genesis wrote where it is, rather than rewriting it.
         let mut genesis_history = if self.skip_genesis_history {
             None
@@ -139,27 +151,26 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
             )?)
         };
 
-        // Single worker thread for keccak hashing: owns the hashed ETL collector, receives
-        // batches over a bounded channel, and returns the collector when the sender drops.
-        let (hash_tx, hash_rx) = mpsc::sync_channel::<
-            Vec<(alloy_primitives::Address, B256, CompactU256)>,
-        >(HASH_WORKER_QUEUE_DEPTH);
+        // The hash worker owns the hashed ETL collector: it keccaks each chunk across the rayon
+        // pool, inserts on its own thread, and returns the collector when the sender drops.
+        let (hash_tx, hash_rx) =
+            mpsc::sync_channel::<Vec<(B256, B256, CompactU256)>>(HASH_WORKER_QUEUE_DEPTH);
         let hashed_etl_dir = etl_dir;
         let hash_worker =
             thread::spawn(move || -> eyre::Result<Collector<Vec<u8>, CompactU256>> {
                 let mut hashed_collector: Collector<Vec<u8>, CompactU256> =
                     Collector::new(ETL_FILE_SIZE, Some(hashed_etl_dir));
                 while let Ok(chunk) = hash_rx.recv() {
-                    let mut last_addr = alloy_primitives::Address::ZERO;
-                    let mut hashed_addr = B256::ZERO;
-                    for (address, slot, value) in chunk {
-                        if address != last_addr {
-                            last_addr = address;
-                            hashed_addr = keccak256(address);
-                        }
-                        let mut hashed_key = Vec::with_capacity(64);
-                        hashed_key.extend_from_slice(hashed_addr.as_slice());
-                        hashed_key.extend_from_slice(keccak256(slot).as_slice());
+                    let hashed: Vec<(Vec<u8>, CompactU256)> = chunk
+                        .into_par_iter()
+                        .map(|(hashed_address, slot, value)| {
+                            let mut hashed_key = Vec::with_capacity(64);
+                            hashed_key.extend_from_slice(hashed_address.as_slice());
+                            hashed_key.extend_from_slice(keccak256_uncached(slot).as_slice());
+                            (hashed_key, value)
+                        })
+                        .collect();
+                    for (hashed_key, value) in hashed {
                         hashed_collector
                             .insert(hashed_key, value)
                             .wrap_err("hashed ETL insert failed")?;
@@ -211,8 +222,8 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
             // Preserving the genesis account is critical: TIP20 tokens have bytecode (0xEF)
             // set during genesis, and overwriting with Account::default() would clear the
             // code hash, making the token appear uninitialized.
+            let hashed_address = keccak256_uncached(address);
             if let Entry::Vacant(e) = accounts_seen.entry(address) {
-                let hashed_address = keccak256(address);
                 let mut account_cursor = provider_rw
                     .tx_ref()
                     .cursor_read::<tables::HashedAccounts>()?;
@@ -231,6 +242,7 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
             let mut entry_buf = [0u8; 64];
             let start = Instant::now();
             let mut last_log = start;
+            let entries_before = total_entries;
 
             for i in 0..pair_count {
                 reader
@@ -252,7 +264,7 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
                 }
 
                 // Queue raw data for parallel hashing
-                hash_chunk.push((address, slot, compact_value));
+                hash_chunk.push((hashed_address, slot, compact_value));
 
                 // Send full batches to the hashing worker thread.
                 if hash_chunk.len() >= WORKER_CHUNK_SIZE {
@@ -266,6 +278,7 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
                 log_collection_progress(&address, i, pair_count, start, &mut last_log);
             }
 
+            *slot_counts.entry(address).or_default() += total_entries - entries_before;
             total_blocks += 1;
         }
 
@@ -336,20 +349,47 @@ impl<C: reth_cli::chainspec::ChainSpecParser<ChainSpec: EthChainSpec + EthereumH
                 .save_prune_checkpoint(PruneSegment::StorageHistory, genesis_history_pruned())?,
         }
 
+        // Committed here so the storage tries below can be read from many threads. A load that
+        // fails past this point needs a fresh datadir, as any failed load does.
+        provider_rw.commit()?;
+
         info!(
             target: "tempo::cli",
             addresses = accounts_seen.len(),
             "Hashed accounts written, computing state root and trie nodes..."
         );
 
+        let trie_start = Instant::now();
+        let provider_rw = provider_factory.database_provider_rw()?;
         // Rebuild the merkle trie from scratch so the sparse trie cache on
         // block 1 doesn't hit stale genesis nodes and stall on a full rebuild.
-        let trie_start = Instant::now();
         provider_rw.tx_ref().clear::<tables::AccountsTrie>()?;
         provider_rw.tx_ref().clear::<tables::StoragesTrie>()?;
 
-        let mut resume: Option<IntermediateStateRootState> = None;
+        // The state root pass reads these roots back instead of walking their slots.
         let mut trie_writes = 0usize;
+        for (address, slots) in &slot_counts {
+            if *slots < PARALLEL_TRIE_MIN_SLOTS {
+                continue;
+            }
+            let hashed_address = keccak256_uncached(address);
+            if let Some((root, nodes)) =
+                parallel_storage_trie(&provider_factory, &provider_rw, hashed_address)?
+            {
+                trie_writes += nodes;
+                info!(
+                    target: "tempo::cli",
+                    %address,
+                    slots,
+                    %root,
+                    nodes,
+                    elapsed = ?trie_start.elapsed(),
+                    "Storage trie built by nibble"
+                );
+            }
+        }
+
+        let mut resume: Option<IntermediateStateRootState> = None;
 
         // Incrementally compute the merkle root over all hashed accounts/storages.
         let state_root = {
@@ -444,6 +484,113 @@ where
             .map(|(addr, account)| (*addr, Some(*account))),
     )?;
     Ok(())
+}
+
+/// One account's storage trie: sixteen subtries built in parallel, one per leading nibble of
+/// the hashed slot, each written as it completes, then joined at the root. The nodes are what
+/// reth's own walk stores, so the state root pass reuses the root and later blocks update the
+/// trie incrementally. Returns the root and the nodes written.
+///
+/// `None` when a subtrie root is not a stored branch node, which only a tiny or skewed account
+/// produces; the sequential pass then builds the account over nodes it would store itself.
+fn parallel_storage_trie<N: ProviderNodeTypes>(
+    factory: &ProviderFactory<N>,
+    writer: &impl TrieWriter,
+    hashed_address: B256,
+) -> eyre::Result<Option<(B256, usize)>> {
+    let (tx, rx) = mpsc::sync_channel(2);
+    let mut roots = [None; STORAGE_SUBTRIES as usize];
+    let mut written = 0;
+    let joined = thread::scope(|scope| -> eyre::Result<bool> {
+        scope.spawn(move || {
+            (0..STORAGE_SUBTRIES)
+                .into_par_iter()
+                .for_each_with(tx, |tx, nibble| {
+                    let _ = tx.send((nibble, build_subtrie(factory, hashed_address, nibble)));
+                });
+        });
+        for (nibble, built) in rx {
+            let Some((root, mut nodes)) = built? else {
+                continue;
+            };
+            let prefix = Nibbles::from_nibbles([nibble]);
+            // Built alone it carried the subtrie's root hash; in the whole trie it is an inner node.
+            let Some(mut inner) = nodes.remove(&Nibbles::new()) else {
+                return Ok(false);
+            };
+            inner.root_hash = None;
+            let mut updates = StorageTrieUpdates::default();
+            updates.storage_nodes.insert(prefix, inner);
+            for (path, node) in nodes {
+                updates.storage_nodes.insert(prefix.join(&path), node);
+            }
+            written += writer.write_trie_updates(TrieUpdates {
+                storage_tries: B256Map::from_iter([(hashed_address, updates)]),
+                ..Default::default()
+            })?;
+            roots[nibble as usize] = Some(root);
+        }
+        Ok(true)
+    })?;
+    if !joined {
+        return Ok(None);
+    }
+
+    let mut top = HashBuilder::default().with_updates(true);
+    for (nibble, root) in roots.into_iter().enumerate() {
+        if let Some(root) = root {
+            top.add_branch(Nibbles::from_nibbles([nibble as u8]), root, true);
+        }
+    }
+    let root = top.root();
+    let (_, nodes) = top.split();
+    written += writer.write_trie_updates(TrieUpdates {
+        storage_tries: B256Map::from_iter([(
+            hashed_address,
+            StorageTrieUpdates {
+                storage_nodes: nodes,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    })?;
+    Ok(Some((root, written)))
+}
+
+/// The subtrie under one leading nibble of an account's hashed slots, built over the keys with
+/// that nibble stripped: its root and its stored nodes, paths relative to the nibble. `None`
+/// when no slot falls under it.
+fn build_subtrie<N: ProviderNodeTypes>(
+    factory: &ProviderFactory<N>,
+    hashed_address: B256,
+    nibble: u8,
+) -> eyre::Result<Option<(B256, HashMap<Nibbles, BranchNodeCompact>)>> {
+    let provider = factory.provider()?;
+    let mut cursor = provider
+        .tx_ref()
+        .cursor_dup_read::<tables::HashedStorages>()?;
+    let mut builder = HashBuilder::default().with_updates(true);
+    let mut first = B256::ZERO;
+    first[0] = nibble << 4;
+    let mut entry = cursor.seek_by_key_subkey(hashed_address, first)?;
+    let mut leaves = 0u64;
+    while let Some(StorageEntry { key, value }) = entry {
+        if key[0] >> 4 != nibble {
+            break;
+        }
+        builder.add_leaf(
+            Nibbles::unpack(key).slice(1..),
+            alloy_rlp::encode_fixed_size(&value).as_ref(),
+        );
+        leaves += 1;
+        entry = cursor.next_dup_val()?;
+    }
+    if leaves == 0 {
+        return Ok(None);
+    }
+    let root = builder.root();
+    let (_, nodes) = builder.split();
+    Ok(Some((root, nodes)))
 }
 
 /// The dump, unpacked on the way through if it was compressed. Its first four bytes say which.
@@ -706,7 +853,8 @@ fn load_etl_to_cursor(
     Ok(())
 }
 
-/// Log collection progress every 5 seconds and on the final entry.
+/// Log collection progress every 5 seconds and on the final entry. The clock is read once
+/// per 65,536 entries: read per entry, it was most of the reader's own time.
 fn log_collection_progress(
     address: &alloy_primitives::Address,
     index: u64,
@@ -714,7 +862,11 @@ fn log_collection_progress(
     start: Instant,
     last_log: &mut Instant,
 ) {
-    if last_log.elapsed() >= Duration::from_secs(5) || index + 1 == total {
+    let done = index + 1;
+    if done != total && !done.is_multiple_of(65_536) {
+        return;
+    }
+    if last_log.elapsed() >= Duration::from_secs(5) || done == total {
         let pct = ((index + 1) as f64 / total as f64) * 100.0;
         let elapsed = start.elapsed();
         let pairs_per_sec = (index + 1) as f64 / elapsed.as_secs_f64();
