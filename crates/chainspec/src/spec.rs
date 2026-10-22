@@ -4,7 +4,7 @@ use crate::{
     bootnodes::{moderato_nodes, presto_nodes},
     network_identity::NetworkIdentity,
 };
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
@@ -53,7 +53,7 @@ macro_rules! tempo_genesis_info {
                 configurable_account_recovery_factory: Option<Address>,
                 /// Every other key, which no field above reads.
                 #[serde(flatten, skip_serializing)]
-                unread: BTreeMap<String, Unread>,
+                unread: BTreeMap<String, serde_json::Value>,
             }
 
             impl TempoGenesisInfo {
@@ -71,55 +71,20 @@ macro_rules! tempo_genesis_info {
     };
 }
 
-/// What an unread key holds: nothing this Tempo looks at, whatever it is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "serde::de::IgnoredAny")]
-struct Unread;
-
-impl From<serde::de::IgnoredAny> for Unread {
-    fn from(_: serde::de::IgnoredAny) -> Self {
-        Self
-    }
-}
-
 tempo_hardfork::tempo_post_genesis_hardforks!(tempo_genesis_info);
 
 impl TempoGenesisInfo {
-    /// Extract Tempo genesis info from genesis extra_fields. These fields are consensus-critical
-    /// and outside the genesis hash, so a value no field can read, or a key none reads, is an
-    /// error rather than a default; the one key let through is a newer Tempo's fork time.
+    /// Extract Tempo genesis info from genesis extra_fields. The fields are consensus-critical yet
+    /// outside the genesis hash, so a key or value no field reads is an error, not a default.
     fn extract_from(genesis: &Genesis) -> Result<Self, serde_json::Error> {
         let info: Self = genesis.config.extra_fields.deserialize_as()?;
-        let unknown: Vec<_> = info
-            .unread
-            .keys()
-            .filter(|key| !Self::is_fork_time_key(key))
-            .collect();
-        if !unknown.is_empty() {
-            return Err(serde::de::Error::custom(alloc::format!(
-                "unknown keys {unknown:?}"
+        if !info.unread.is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "unknown keys {:?}",
+                info.unread.keys()
             )));
         }
         Ok(info)
-    }
-
-    /// Fork times of a Tempo newer than this one, for the node to warn about once logging is up.
-    pub fn newer_fork_times(&self) -> impl Iterator<Item = &str> {
-        self.unread.keys().map(String::as_str)
-    }
-
-    /// A fork's activation time as upstream names one, `t<N>Time` (letters after the number as
-    /// in `t1aTime`): the one key a newer Tempo reads and this one does not, while the node must
-    /// keep running until that fork.
-    fn is_fork_time_key(key: &str) -> bool {
-        let Some(body) = key
-            .strip_prefix('t')
-            .and_then(|key| key.strip_suffix("Time"))
-        else {
-            return false;
-        };
-        let digits = body.trim_end_matches(|c: char| c.is_ascii_lowercase());
-        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
     }
 
     pub fn epoch_length(&self) -> Option<NonZeroU64> {
@@ -669,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn a_misspelled_key_is_refused_whatever_it_holds() {
+    fn an_unread_key_is_refused_whatever_it_holds() {
         for (extra, key) in [
             (
                 serde_json::json!({ "epochLength": 20, "epochLenght": 20 }),
@@ -679,23 +644,12 @@ mod tests {
                 serde_json::json!({ "t12Time": null, "t12Tme": null }),
                 "t12Tme",
             ),
+            (serde_json::json!({ "t99Time": 7 }), "t99Time"),
+            (serde_json::json!({ "t99Time": null }), "t99Time"),
         ] {
             let err = super::TempoChainSpec::try_from_genesis(genesis_with(extra))
                 .expect_err("an unknown key must not parse");
-            assert_eq!(err.to_string(), alloc::format!("unknown keys [{key:?}]"));
-        }
-    }
-
-    #[test]
-    fn a_newer_forks_time_is_kept_to_warn_about() {
-        let genesis = genesis_with(serde_json::json!({ "t99Time": 7, "t99aTime": null }));
-        let spec = super::TempoChainSpec::try_from_genesis(genesis).unwrap();
-        assert_eq!(
-            spec.info.newer_fork_times().collect::<Vec<_>>(),
-            ["t99Time", "t99aTime"]
-        );
-        for key in ["tTime", "t12Tme", "T12Time", "t12Times", "ta1Time"] {
-            assert!(!super::TempoGenesisInfo::is_fork_time_key(key), "{key}");
+            assert_eq!(err.to_string(), format!("unknown keys [{key:?}]"));
         }
     }
 
